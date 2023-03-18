@@ -1,3 +1,5 @@
+import os
+import sys
 import pygame
 import random
 import math
@@ -9,7 +11,7 @@ import pyaudio
 # TODO should be overlapping windows
 
 
-audio, sample_rate = librosa.load('music.mp3', sr=22050, mono=True, offset=15)
+audio, sample_rate = librosa.load(sys.argv[1], sr=22050, mono=True, offset=15)
 
 # initialize pygame
 pygame.init()
@@ -46,7 +48,7 @@ text_angle = 0
 center = np.array([WIDTH / 2, HEIGHT / 2])
 
 # set up the FFT parameters
-hop_length = 512
+hop_length = 256
 window_size = 2048
 
 p = pyaudio.PyAudio()
@@ -89,17 +91,25 @@ def get_particles(low_freq_amp, radius):
         velocity = np.array(
             [radius * math.cos(theta), radius * math.sin(theta)])
         position = center + velocity
-        particle = {'position': position,
-                    'velocity': 0.2 * velocity / np.linalg.norm(velocity),
-                    'color': (random.randint(0, 100), random.randint(100, 255), random.randint(0, 100))}
+        particle = {
+            "position": position,
+            "velocity": 0.2 * velocity / np.linalg.norm(velocity),
+            "color": (random.randint(0, 100), random.randint(100, 255), random.randint(0, 100)),
+            "is_df": random.random() < 0.02,
+            "rotation": 0,
+        }
         particles.append(particle)
 
     # update the position of each particle
     for particle in particles:
-        particle['position'][0] += particle['velocity'][0] * \
-            low_freq_amp / 10
-        particle['position'][1] += particle['velocity'][1] * \
-            low_freq_amp / 10
+        if particle["is_df"]:
+            particle["rotation"] = (particle["rotation"] + low_freq_amp / 100) % 360
+            factor = low_freq_amp / 10 * 0.35
+        else:
+            factor = low_freq_amp / 10
+
+        particle['position'][0] += particle['velocity'][0] * factor
+        particle['position'][1] += particle['velocity'][1] * factor
 
         # clip
         # TODO can particles be locked at center??
@@ -114,6 +124,9 @@ def get_particles(low_freq_amp, radius):
 
     return particles
 
+image = pygame.image.load(os.path.abspath("df_logo.png"))
+image.convert()
+image = pygame.transform.scale(image, (50, 50))
 
 samples = np.zeros((window_size,), dtype=np.float32)
 i = 0
@@ -150,7 +163,6 @@ for sample in audio:
                         k * (initial_font_size + low_freq_amp / 20)))
         radius = font_size + 60
 
-        particles = get_particles(low_freq_amp, radius)
 
         # create the new font with the updated size
         font = pygame.font.Font(None, font_size)
@@ -165,10 +177,18 @@ for sample in audio:
 
         pygame.draw.circle(screen, (3, 37, 23), center, radius)
 
+        # TODO scatter background with light (cracks)
         # draw the particles
+        particles = get_particles(low_freq_amp, radius)
         for particle in particles:
-            pygame.draw.circle(screen, particle['color'], [int(
-                particle['position'][0]), int(particle['position'][1])], 5)
+            if particle["is_df"]:
+                rect = image.get_rect()
+                rect.center = (int(particle['position'][0]), int(particle['position'][1]))
+                image_ = pygame.transform.rotate(image.copy(), particle['rotation'])
+                screen.blit(image_, rect)
+            else:
+                pygame.draw.circle(screen, particle['color'], [int(
+                    particle['position'][0]), int(particle['position'][1])], 7.5)
 
         # make the drop-shadow
         text_bitmap = font.render(artist_name, True, (128, 128, 128))
