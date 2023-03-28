@@ -1,4 +1,3 @@
-/venv
 *.mp3
 /.cargo
 /target

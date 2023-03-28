@@ -1,28 +1,61 @@
+use anyhow::{anyhow, Result};
 use bevy::{
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
-    text::{BreakLineOn, Text2dBounds},
-    window::{WindowLevel, WindowMode, WindowResolution},
+    text::BreakLineOn,
+    window::{WindowLevel, WindowResolution},
+};
+use clap::Parser;
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, SampleRate, Stream, StreamConfig,
 };
 use rand::Rng;
-use std::f32::consts::TAU;
+use std::{collections::VecDeque, f32::consts::TAU, sync::RwLock};
 
-const CENTER: Vec3 = Vec3::new(0.0, 0.0, 0.0);
+#[derive(Parser)]
+struct Cli {
+    input_device_index: usize,
+    artist_name: String,
+    #[arg(short, default_value_t = 22050)]
+    sample_rate: u32,
+    #[arg(short, default_value_t = 256)]
+    buffer_size: u32,
+    #[arg(short, default_value_t = 1)]
+    channels: u16,
+    #[arg(long, default_value_t = 35)]
+    fps: u32, // TODO test that this matches by printing time delta, TODO higher fps = more particles right now
+    #[arg(long, default_value_t = 0.8)]
+    particle_amp_threshold: f32,
+    #[arg(long, default_value_t = 0.2)]
+    particle_logo_probability: f32,
+    #[arg(long, default_value_t = String::from("#053517"))]
+    background_color: String,
+    #[arg(long, default_value_t = String::from("#FF8080"))]
+    particle_normal_color: String, // TODO is overridden by random values
+    #[arg(long, default_value_t = 10.0)]
+    particle_normal_radius: f32,
+    #[arg(long, default_value_t = String::from("#032517"))]
+    circle_color: String,
+    #[arg(long, default_value_t = 100.0)]
+    circle_radius: f32,
+}
 
-const ARTIST_NAME: &str = "Ar ti st Name";
-const ARTIST_NAME_FONT_SIZE: f32 = 60.; // TODO can be computed?
+#[derive(Resource)]
+struct Params {
+    time_step: f32,
+    artist_name: String,
+    particle_amp_threshold: f32,
+    particle_logo_probability: f32,
+    particle_normal_color: Color,
+    particle_normal_radius: f32,
+    circle_color: Color,
+    circle_radius: f32,
+}
 
-const TIME_STEP: f32 = 1.0 / 35.0;
-const BACKGROUND_COLOR: Color = Color::rgb(0.9, 0.9, 0.9);
+const N_SAMPLES: usize = 480; // TODO always 480?
 
-const PARTICLE_NORMAL_COLOR: Color = Color::rgb(1.0, 0.5, 0.5);
-const PARTICLE_NORMAL_RADIUS: f32 = 10.0;
-
-const PARTICLE_LOGO_PROBABILITY: f32 = 0.2;
-const PARTICLE_DF_RADIUS: f32 = 20.0;
-
-const CIRCLE_COLOR: Color = Color::rgb(0.5, 0.5, 1.0);
-const CIRCLE_RADIUS: f32 = 100.0;
+// TODO WARN bevy_text::glyph_brush: warning[B0005]: Number of font atlases has exceeded the maximum of 16. Performance and memory usage may suffer.
 
 #[derive(Component)]
 struct Particle {
@@ -32,53 +65,72 @@ struct Particle {
 #[derive(Component)]
 struct ArtistNameText;
 
+#[derive(Component)]
+struct CenterCircle;
+
 #[derive(Resource)]
 struct LogoImage {
     handle: Handle<Image>,
 }
 
-fn fetch_audio_samples(asset_server: Res<AssetServer>) {
+#[derive(Resource)]
+struct LowFreqAmp(f32);
+
+static AUDIO_BUFFER: RwLock<VecDeque<f32>> = RwLock::new(VecDeque::new());
+
+fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>) {
     // TODO
+    let mut r = AUDIO_BUFFER.write().unwrap();
+    dbg!(r.len());
+    low_freq_amp.0 = r.drain(..).sum();
+    let mut rng = rand::thread_rng();
+    low_freq_amp.0 = rng.gen_range(0.8..1.0);
 }
 
 fn create_particles(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    low_freq_amp: Res<LowFreqAmp>,
     logo_image: Res<LogoImage>,
+    params: Res<Params>,
 ) {
-    let mut rng = rand::thread_rng();
-
-    if rng.gen_range(0.0..1.0) > 0.2 {
-        return;
-    }
-
     // add new particles
-    let theta: f32 = rng.gen_range(0.0..TAU);
-    let velocity = Vec2::new(CIRCLE_RADIUS * theta.cos(), CIRCLE_RADIUS * theta.sin());
-    let position = CENTER + Vec3::from((velocity, 0.0));
+    if low_freq_amp.0 > params.particle_amp_threshold {
+        let mut rng = rand::thread_rng();
+        let theta: f32 = rng.gen_range(0.0..TAU);
+        let velocity = Vec2::new(
+            params.circle_radius * theta.cos(),
+            params.circle_radius * theta.sin(),
+        );
+        let position = Vec3::from((velocity, 0.0));
+        // TODO circle radius is changing!
 
-    if rng.gen_range(0.0..1.0) < PARTICLE_LOGO_PROBABILITY {
-        commands.spawn((
-            SpriteBundle {
-                texture: logo_image.handle.clone(),
-                transform: Transform::from_translation(position),
-                ..default()
-            },
-            Particle { velocity },
-        ));
-    } else {
-        commands.spawn((
-            MaterialMesh2dBundle {
-                mesh: meshes
-                    .add(shape::Circle::new(PARTICLE_NORMAL_RADIUS).into())
-                    .into(),
-                material: materials.add(ColorMaterial::from(PARTICLE_NORMAL_COLOR)),
-                transform: Transform::from_translation(position),
-                ..default()
-            },
-            Particle { velocity },
-        ));
+        if rng.gen_range(0.0..1.0) < params.particle_logo_probability {
+            commands.spawn((
+                SpriteBundle {
+                    texture: logo_image.handle.clone(),
+                    transform: Transform::from_translation(position),
+                    ..default()
+                },
+                Particle { velocity },
+            ));
+        } else {
+            let r = rng.gen_range(0.0..0.4);
+            let g = rng.gen_range(0.4..1.0);
+            let b = rng.gen_range(0.0..0.4);
+            commands.spawn((
+                MaterialMesh2dBundle {
+                    mesh: meshes
+                        .add(shape::Circle::new(params.particle_normal_radius).into())
+                        .into(),
+                    material: materials.add(ColorMaterial::from(Color::rgb(r, g, b))),
+                    transform: Transform::from_translation(position),
+                    ..default()
+                },
+                Particle { velocity },
+            ));
+        }
     }
 }
 
@@ -86,32 +138,98 @@ fn update_particles(
     mut commands: Commands,
     mut query: Query<(Entity, &Particle, &mut Transform)>,
     window_query: Query<&Window>,
+    low_freq_amp: Res<LowFreqAmp>,
+    params: Res<Params>,
 ) {
     let window = window_query.get_single().unwrap();
     let max_x = window.width() / 2.;
     let max_y = window.height() / 2.;
     for (entity, particle, mut transform) in &mut query {
         // move particles
-        transform.translation.x += particle.velocity.x * TIME_STEP;
-        transform.translation.y += particle.velocity.y * TIME_STEP;
+        transform.translation.x += particle.velocity.x * params.time_step * low_freq_amp.0;
+        transform.translation.y += particle.velocity.y * params.time_step * low_freq_amp.0;
 
         // remove particles that are off the screen
         if transform.translation.x.abs() > max_x || transform.translation.y.abs() > max_y {
-            println!("despawn {:?}", entity);
             commands.entity(entity).despawn();
         }
     }
 }
 
-fn update_artist_name(mut query: Query<&mut Text, With<ArtistNameText>>) {
-    // TODO
-    // for mut text in &mut query {
-    //     text.sections[0].style.font_size = if text.sections[0].style.font_size > 100. {
-    //         50.
-    //     } else {
-    //         150.
-    //     };
-    // }
+// TODO merge with update_circle if they stay the same
+fn update_artist_name(
+    mut query: Query<&mut Transform, With<ArtistNameText>>,
+    low_freq_amp: Res<LowFreqAmp>,
+) {
+    if let Ok(mut transform) = query.get_single_mut() {
+        transform.scale = Vec3::new(low_freq_amp.0, low_freq_amp.0, 0.);
+    }
+}
+
+fn update_circle(
+    mut query: Query<&mut Transform, With<CenterCircle>>,
+    low_freq_amp: Res<LowFreqAmp>,
+) {
+    if let Ok(mut transform) = query.get_single_mut() {
+        transform.scale = Vec3::new(low_freq_amp.0, low_freq_amp.0, 0.);
+    }
+}
+
+fn init_audio_input(
+    device: &Device,
+    channels: u16,
+    sample_rate: u32,
+    buffer_size: u32,
+) -> Result<Stream> {
+    let supported_input_configs = device.supported_input_configs()?.collect::<Vec<_>>();
+    let config = StreamConfig {
+        channels,
+        sample_rate: SampleRate(sample_rate),
+        buffer_size: cpal::BufferSize::Fixed(buffer_size), // TODO what is this doing?
+    };
+
+    let channels: usize = channels.into();
+    let data_len: usize = channels * N_SAMPLES;
+    device
+        .build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // TODO what if one channel is inverted?
+
+                // assert that data length is an integer multiple of channels, should not be deleted
+                assert!(data.len() == data_len);
+
+                // remap to one channel
+                // no need to use chunks_exact as exact length is asserted above
+                let mut new_samples = [0_f32; N_SAMPLES];
+                for (index, samples) in data.chunks(channels).enumerate() {
+                    new_samples[index] = samples.iter().sum::<f32>() / (channels as f32);
+                }
+
+                // TODO downsample to 22kHz ??
+
+                {
+                    // lock AUDIO_BUFFER as short as possible
+                    let mut w = AUDIO_BUFFER.write().unwrap();
+                    w.extend(new_samples);
+                }
+            },
+            |err| {
+                // TODO change this?
+                panic!("{}", err);
+            },
+            None, // TODO change? Some(Duration::new(2, 0))
+        )
+        .map_err(|err| match err {
+            cpal::BuildStreamError::StreamConfigNotSupported => anyhow!(
+                "Unsupported configuration for this device.\n\
+                Requested configuration: {:?};\n\
+                Supported configuration: {:?}",
+                config,
+                supported_input_configs
+            ),
+            _ => anyhow!(err),
+        })
 }
 
 fn setup(
@@ -119,29 +237,33 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
+    params: Res<Params>,
 ) {
     commands.spawn(Camera2dBundle::default());
 
     // add center circle
     // TODO particles must spawn below this!
-    commands.spawn(MaterialMesh2dBundle {
-        mesh: meshes
-            .add(shape::Circle::new(CIRCLE_RADIUS).into()) // TODO remove minus
-            .into(),
-        material: materials.add(ColorMaterial::from(CIRCLE_COLOR)),
-        transform: Transform::from_translation(CENTER),
-        ..default()
-    });
+    commands.spawn((
+        MaterialMesh2dBundle {
+            mesh: meshes
+                .add(shape::Circle::new(params.circle_radius).into()) // TODO remove minus
+                .into(),
+            material: materials.add(ColorMaterial::from(params.circle_color)),
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
+            ..default()
+        },
+        CenterCircle,
+    ));
 
     // add artist name text
     commands.spawn((
         Text2dBundle {
             text: Text {
                 sections: vec![TextSection::new(
-                    ARTIST_NAME,
+                    params.artist_name.clone(),
                     TextStyle {
                         font: asset_server.load("FiraSans-Bold.ttf"),
-                        font_size: ARTIST_NAME_FONT_SIZE,
+                        font_size: 60., // TODO font size can be computed?,
                         color: Color::WHITE,
                         ..default()
                     },
@@ -162,7 +284,55 @@ fn setup(
     });
 }
 
-fn main() {
+// TODO can implement into for String??
+fn hex_to_bevy_color(hex: String) -> Result<Color> {
+    let (r, g, b) = {
+        use colors_transform::{Color, Rgb};
+        let color = Rgb::from_hex_str(hex.as_str()).map_err(|err| anyhow!(err.message))?;
+        (
+            color.get_red() / 255.,
+            color.get_green() / 255.,
+            color.get_blue() / 255.,
+        )
+    };
+    Ok(Color::rgb(r, g, b))
+}
+
+fn main() -> Result<()> {
+    // get and list input devices to the user
+    println!("Available Input Devices:");
+    let host = cpal::default_host();
+    let devices = host.input_devices()?.collect::<Vec<_>>();
+    for (i, device) in devices.iter().enumerate() {
+        println!(
+            "{}: {}",
+            i,
+            device.name().unwrap_or(String::from("unknown"))
+        );
+    }
+
+    // parse args
+    let args = Cli::parse();
+    let time_step = 1.0 / args.fps as f32;
+    let params = Params {
+        time_step,
+        artist_name: args.artist_name,
+        particle_amp_threshold: args.particle_amp_threshold,
+        particle_logo_probability: args.particle_logo_probability,
+        circle_color: hex_to_bevy_color(args.circle_color)?,
+        particle_normal_color: hex_to_bevy_color(args.particle_normal_color)?,
+        particle_normal_radius: args.particle_normal_radius,
+        circle_radius: args.circle_radius,
+    };
+    let background_color = hex_to_bevy_color(args.background_color)?;
+
+    // start audio input stream
+    let device = devices
+        .get(args.input_device_index)
+        .ok_or(anyhow!("Invalid input device index"))?;
+    let stream = init_audio_input(&device, args.channels, args.sample_rate, args.buffer_size)?;
+    stream.play()?;
+
     App::new()
         // TODO remove default plugins, use only required plugins
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -176,18 +346,23 @@ fn main() {
             }),
             ..default()
         }))
-        .insert_resource(ClearColor(BACKGROUND_COLOR))
+        .insert_resource(params)
+        .insert_resource(ClearColor(background_color))
+        .insert_resource(LowFreqAmp(0.))
         .add_startup_system(setup)
         .add_systems(
             (
-                fetch_audio_samples,
-                update_artist_name.after(fetch_audio_samples),
-                create_particles.after(fetch_audio_samples),
+                get_low_freq_amp,
+                update_artist_name.after(get_low_freq_amp),
+                update_circle.after(get_low_freq_amp),
+                create_particles.after(get_low_freq_amp),
                 update_particles.after(create_particles),
             )
                 .in_schedule(CoreSchedule::FixedUpdate),
         )
-        .insert_resource(FixedTime::new_from_secs(TIME_STEP))
+        .insert_resource(FixedTime::new_from_secs(time_step))
         .add_system(bevy::window::close_on_esc)
         .run();
+
+    Ok(())
 }

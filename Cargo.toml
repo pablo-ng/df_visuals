@@ -6,8 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.70"
 # bevy = { version = "0.10.0", features = ["dynamic_linking"] } // TODO revert dynamic_linking for bevy for production
 bevy = "0.10.0"
+clap = { version = "4.1.13", features = ["derive"] }
+colors-transform = "0.2.11"
+cpal = "0.15.1"
 rand = "0.8.5"
 
 # Enable a small amount of optimization in debug mode
