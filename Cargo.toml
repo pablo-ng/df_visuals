@@ -14,6 +14,7 @@ colors-transform = "0.2.11"
 cpal = "0.15.1"
 mel_filter = "0.1.1"
 rand = "0.8.5"
+rubato = "0.12.0"
 rustfft = "6.1.0"
 
 # Enable a small amount of optimization in debug mode

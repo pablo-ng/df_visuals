@@ -80,33 +80,28 @@ struct LowFreqAmp(f32);
 
 static AUDIO_BUFFER: RwLock<VecDeque<f32>> = RwLock::new(VecDeque::new());
 
-const WINDOW_SIZE: usize = 2048;
-const HOP_LENGTH: usize = 256;
+const WINDOW_SIZE: usize = 4096;
+const HOP_LENGTH: usize = 512;
+const AUDIO_BUFFER_MAX_SIZE: usize = WINDOW_SIZE * 16;
 
 fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>, params: Res<Params>) {
     // TODO use reader and not drain but use circular?
 
     // TODO compute the update rate, could also add a flag "newdata" to the buffer
 
-    let mut buffer: [Complex<f32>; WINDOW_SIZE] = [Complex::new(0., 0.); WINDOW_SIZE];
-    {
+    let mut buffer = {
         // lock AUDIO_BUFFER as short as possible
         let mut w = AUDIO_BUFFER.write().unwrap();
         if w.len() < WINDOW_SIZE {
             return;
         }
-
-        for (index, value) in w.drain(..HOP_LENGTH).enumerate() {
-            buffer[index].re = value;
-        }
-
-        for (index, value) in w.range(..(WINDOW_SIZE - HOP_LENGTH)).enumerate() {
-            buffer[HOP_LENGTH + index].re = *value;
-        }
-
-        // TODO optimize?
-        // TODO assert index = window size at end
-    }
+        let buffer = w
+            .range(..WINDOW_SIZE)
+            .map(|value| Complex::new(*value, 0.0))
+            .collect::<Vec<_>>();
+        w.drain(..HOP_LENGTH);
+        buffer
+    };
 
     let mut planner = FftPlanner::new(); // TODO avx planner
     let fft = planner.plan_fft_forward(WINDOW_SIZE);
@@ -244,6 +239,8 @@ fn update_circle(
     }
 }
 
+use rubato::{InterpolationParameters, InterpolationType, Resampler, SincFixedIn, WindowFunction};
+
 fn init_audio_input(
     device: &Device,
     channels: u16,
@@ -258,7 +255,7 @@ fn init_audio_input(
     };
 
     let channels: usize = channels.into();
-    let data_len: usize = channels * N_SAMPLES;
+    let data_len: usize = channels * N_SAMPLES; // TODO set buffer size to this?
     device
         .build_input_stream(
             &config,
@@ -266,7 +263,12 @@ fn init_audio_input(
                 // TODO what if one channel is inverted?
 
                 // assert that data length is an integer multiple of channels, should not be deleted
-                assert!(data.len() == data_len);
+                assert!(
+                    data.len() == data_len,
+                    "expected {} but received {}",
+                    data_len,
+                    data.len()
+                );
 
                 // remap to one channel
                 // no need to use chunks_exact as exact length is asserted above
@@ -277,9 +279,41 @@ fn init_audio_input(
 
                 // TODO downsample to 22kHz ??
 
+                let params = InterpolationParameters {
+                    sinc_len: 256,
+                    f_cutoff: 0.95,
+                    interpolation: InterpolationType::Linear,
+                    oversampling_factor: 256,
+                    window: WindowFunction::BlackmanHarris2,
+                };
+                let mut resampler = SincFixedIn::<f32>::new(
+                    sample_rate as f64 / 220500 as f64,
+                    2.0,
+                    params,
+                    N_SAMPLES,
+                    1,
+                )
+                .unwrap();
+
+                let new_samples = vec![new_samples; 1];
+                let new_samples = resampler.process(&new_samples, None).unwrap();
+                let new_samples = &new_samples[0];
+                // dbg!(new_samples.len());
+
+                https://docs.rs/rubato/latest/rubato/
+
+
+
+
+                
                 {
                     // lock AUDIO_BUFFER as short as possible
                     let mut w = AUDIO_BUFFER.write().unwrap();
+                    if w.len() > AUDIO_BUFFER_MAX_SIZE {
+                        println!("AUDIO_BUFFER size exceeded");
+                        // remove first N_SAMPLES samples
+                        w.drain(..N_SAMPLES);
+                    }
                     w.extend(new_samples);
                 }
             },
