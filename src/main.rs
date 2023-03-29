@@ -11,6 +11,7 @@ use cpal::{
     Device, SampleRate, Stream, StreamConfig,
 };
 use rand::Rng;
+use rustfft::{num_complex::Complex, FftPlanner};
 use std::{collections::VecDeque, f32::consts::TAU, sync::RwLock};
 
 #[derive(Parser)]
@@ -51,6 +52,7 @@ struct Params {
     particle_normal_radius: f32,
     circle_color: Color,
     circle_radius: f32,
+    sample_rate: u32,
 }
 
 const N_SAMPLES: usize = 480; // TODO always 480?
@@ -78,13 +80,80 @@ struct LowFreqAmp(f32);
 
 static AUDIO_BUFFER: RwLock<VecDeque<f32>> = RwLock::new(VecDeque::new());
 
-fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>) {
-    // TODO
-    let mut r = AUDIO_BUFFER.write().unwrap();
-    dbg!(r.len());
-    low_freq_amp.0 = r.drain(..).sum();
-    let mut rng = rand::thread_rng();
-    low_freq_amp.0 = rng.gen_range(0.8..1.0);
+const WINDOW_SIZE: usize = 2048;
+const HOP_LENGTH: usize = 256;
+
+fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>, params: Res<Params>) {
+    // TODO use reader and not drain but use circular?
+
+    // TODO compute the update rate, could also add a flag "newdata" to the buffer
+
+    let mut buffer: [Complex<f32>; WINDOW_SIZE] = [Complex::new(0., 0.); WINDOW_SIZE];
+    {
+        // lock AUDIO_BUFFER as short as possible
+        let mut w = AUDIO_BUFFER.write().unwrap();
+        if w.len() < WINDOW_SIZE {
+            return;
+        }
+
+        for (index, value) in w.drain(..HOP_LENGTH).enumerate() {
+            buffer[index].re = value;
+        }
+
+        for (index, value) in w.range(..(WINDOW_SIZE - HOP_LENGTH)).enumerate() {
+            buffer[HOP_LENGTH + index].re = *value;
+        }
+
+        // TODO optimize?
+        // TODO assert index = window size at end
+    }
+
+    let mut planner = FftPlanner::new(); // TODO avx planner
+    let fft = planner.plan_fft_forward(WINDOW_SIZE);
+
+    // compute the fft
+    // TODO use planner with power and abs directly
+    fft.process(&mut buffer);
+
+    // compute the power spectrum
+    let power: Vec<_> = buffer.into_iter().map(|val| val.norm().powi(2)).collect();
+
+    // compute the mel filterbank
+    let n_fft = (WINDOW_SIZE - 1) * 2; // TODO correct?
+    let mel_basis = mel_filter::mel::<f32>(
+        params.sample_rate as usize,
+        n_fft,
+        Some(128), // TODO good?
+        None,
+        None,
+        false,
+        mel_filter::NormalizationFactor::One,
+    );
+
+    // TODO use into_iter everywhere?
+
+    // apply the mel filterbank to the power spectrum
+    let mel_power = mel_basis.iter().map(|values| {
+        values
+            .iter()
+            .zip(power.iter())
+            .map(|(x, y)| x * y)
+            .sum::<f32>()
+    });
+
+    // compute the log mel spectrogram
+    // TODO  complete this
+    // log_mel_power = librosa.power_to_db(mel_power)
+    let log_mel_power = mel_power.map(|val| 10. * val.log10());
+
+    // compute the low-frequency amplitude
+    low_freq_amp.0 = log_mel_power.take(16).sum();
+
+    // low_freq_amp.0 += 1600.;
+    // low_freq_amp.0 *= 0.05;
+
+    dbg!(low_freq_amp.0);
+    // dbg!(r.len()); // TODO should not grow
 }
 
 fn create_particles(
@@ -323,6 +392,7 @@ fn main() -> Result<()> {
         particle_normal_color: hex_to_bevy_color(args.particle_normal_color)?,
         particle_normal_radius: args.particle_normal_radius,
         circle_radius: args.circle_radius,
+        sample_rate: args.sample_rate,
     };
     let background_color = hex_to_bevy_color(args.background_color)?;
 

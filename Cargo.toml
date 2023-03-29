@@ -12,7 +12,9 @@ bevy = "0.10.0"
 clap = { version = "4.1.13", features = ["derive"] }
 colors-transform = "0.2.11"
 cpal = "0.15.1"
+mel_filter = "0.1.1"
 rand = "0.8.5"
+rustfft = "6.1.0"
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
