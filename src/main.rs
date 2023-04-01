@@ -3,16 +3,16 @@ use bevy::{
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
     text::BreakLineOn,
-    window::{WindowMode, WindowResolution},
+    window::{WindowLevel, WindowMode, WindowResolution},
 };
 use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, SampleRate, Stream, StreamConfig,
+    Device, FromSample, SampleFormat, SampleRate, SizedSample, Stream, StreamConfig,
 };
 use mel_filter::{mel, NormalizationFactor};
 use rand::Rng;
-use rubato::{FftFixedIn, Resampler};
+use rubato::{FftFixedOut, Resampler};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::{
     collections::VecDeque,
@@ -21,51 +21,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-#[derive(Parser, Resource)]
-struct Cli {
-    input_device_index: usize,
-    artist_name: String,
-
-    #[arg(
-        short = 's',
-        default_value_t = 22050,
-        help = "Sample rate used for audio processing"
-    )]
-    sample_rate: u32,
-
-    #[arg(
-        short = 'w',
-        default_value_t = 2048,
-        help = "Window size used for audio processing"
-    )]
-    window_size: usize,
-
-    #[arg(short, long, default_value_t = 35)]
-    fps: u32,
-
-    #[arg(
-        long,
-        default_value_t = 22050,
-        help = "Input device sample rate. Will be resamples to sample_rate"
-    )]
-    device_sample_rate: u32,
-
-    #[arg(long, default_value_t = 512, help = "Input device buffer size")]
-    device_buffer_size: u32,
-
-    #[arg(
-        long,
-        default_value_t = 1,
-        help = "Input device number of channels. Will be remapped to 1 channel."
-    )]
-    device_channels: u16,
-
-    #[arg(long, default_value_t = 150.)]
-    particle_amp_threshold: f32,
-    #[arg(long, default_value_t = 0.2)]
-    particle_logo_probability: f32,
-}
-
+const WINDOW_TITLE: &str = "DF Visuals";
 const BACKGROUND_COLOR: Color = Color::rgb(
     5. / u8::MAX as f32,
     53. / u8::MAX as f32,
@@ -78,8 +34,41 @@ const CIRCLE_COLOR: Color = Color::rgb(
     37. / u8::MAX as f32,
     23. / u8::MAX as f32,
 );
-const CIRCLE_RADIUS: f32 = 200.;
-const FONT_SIZE: f32 = 200.;
+
+// TODO choose values wisely
+const AMP_RANGE: [f32; 2] = [-700., 500.];
+const SCALING_RANGE: [f32; 2] = [0.6, 1.4];
+const MOVEMENT_SPEED: f32 = 1. / 60.;
+const AMP_SCALING_RATIO: f32 =
+    (SCALING_RANGE[1] - SCALING_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0]);
+
+#[derive(Parser, Resource)]
+struct Cli {
+    input_device_index: usize,
+    artist_name: String,
+    #[arg(short = 's', default_value_t = 22050)]
+    sample_rate: u32,
+    #[arg(short = 'w', default_value_t = 2048)]
+    window_size: usize,
+    #[arg(short, long, default_value_t = 35)]
+    fps: u32,
+    #[arg(long, default_value_t = true)]
+    fullscreen: bool,
+    #[arg(long, default_value_t = 0)]
+    device_input_config: usize,
+    #[arg(long, default_value_t = 22050)]
+    device_sample_rate: u32,
+    #[arg(long, default_value_t = 512)]
+    device_buffer_size: u32,
+    #[arg(long, default_value_t = 150.)]
+    particle_amp_threshold: f32,
+    #[arg(long, default_value_t = 0.2)]
+    particle_logo_probability: f32,
+    #[arg(long, default_value_t = 200.)]
+    circle_radius: f32,
+    #[arg(long, default_value_t = 200.)]
+    font_size: f32,
+}
 
 #[derive(Component)]
 struct Particle {
@@ -128,7 +117,7 @@ fn update_dynamics(
         buffer
     };
 
-    assert!(buffer.len() == args.window_size); // TODO remove?
+    assert!(buffer.len() == args.window_size); // TODO should not be needed
 
     // compute the fft
     // TODO use planner with power and abs directly
@@ -150,15 +139,14 @@ fn update_dynamics(
     let log_mel_power = mel_power.map(|val| 10. * val.log10());
 
     // compute the dynamics
-    let imin = -500.; // TODO choose values wisely
-    let imax = 500.;
-    let omin = 0.6;
-    let omax = 1.4;
-    let ratio = (omax - omin) / (imax - imin);
-    dynamics.low_freq_amp = log_mel_power.take(16).sum::<f32>().clamp(imin, imax);
-    dynamics.scaling = dynamics.low_freq_amp * ratio - imin * ratio + omin;
-    dynamics.movement = dynamics.low_freq_amp / 100.;
-    dynamics.circle_radius = CIRCLE_RADIUS * dynamics.scaling;
+    dynamics.low_freq_amp = log_mel_power
+        .take(16)
+        .sum::<f32>()
+        .clamp(AMP_RANGE[0], AMP_RANGE[1]);
+    dynamics.scaling = dynamics.low_freq_amp * AMP_SCALING_RATIO - AMP_RANGE[0] * AMP_SCALING_RATIO
+        + SCALING_RANGE[0];
+    dynamics.movement = MOVEMENT_SPEED * dynamics.low_freq_amp;
+    dynamics.circle_radius = args.circle_radius * dynamics.scaling;
 }
 
 fn create_particles(
@@ -244,23 +232,15 @@ fn update_circle_and_text(
     }
 }
 
-fn init_audio_input(
+fn init_audio_input<T: SizedSample>(
     device: &Device,
     sample_rate: u32,
     window_size: usize,
-    device_channels: u16,
-    device_sample_rate: u32,
-    device_buffer_size: u32,
-) -> Result<Stream> {
-    let supported_input_configs = device.supported_input_configs()?.collect::<Vec<_>>();
-    let config = StreamConfig {
-        channels: device_channels,
-        sample_rate: SampleRate(device_sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(device_buffer_size),
-    };
-
-    let device_channels: usize = device_channels.into();
-
+    config: StreamConfig,
+) -> Result<Stream>
+where
+    f32: FromSample<T>,
+{
     {
         // fill AUDIO_BUFFER with 0
         let mut w = AUDIO_BUFFER.write().unwrap();
@@ -268,67 +248,65 @@ fn init_audio_input(
         assert!(w.len() == window_size);
     }
 
-    // TODO still not optimal
-    let mut resampler = FftFixedIn::<f32>::new(
-        device_sample_rate as usize,
-        sample_rate as usize,
-        480, // TODO always? -> no!!
-        1,
-        1,
-    )
-    .unwrap();
-
-    device
-        .build_input_stream(
-            &config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                // remap to one channel
-                // no need to use chunks_exact as exact length is asserted above
-                // TODO what if one channel is inverted?
-                let new_samples = data
-                    .chunks_exact(device_channels)
-                    .map(|values| {
-                        values.iter().map(|value| f32::from(*value)).sum::<f32>()
-                            / (device_channels as f32)
-                    })
-                    .collect::<Vec<f32>>();
-
-                // assert!(new_samples == 480); // TODO!
-
-                // resample to sample_rate
-                // TODO This is a convenience wrapper for process_into_buffer that allocates the output buffer with each call. For realtime applications, use process_into_buffer with a buffer allocated by output_buffer_allocate instead of this function.
-                let new_samples = resampler.process(&[new_samples], None).unwrap();
-                let new_samples = &new_samples[0];
-
-                // assert!(
-                //     new_samples.len() == HOP_LENGTH,
-                //     "got {} new_samples but expected {}",
-                //     new_samples.len(),
-                //     HOP_LENGTH,
-                // );
-
-                {
-                    // lock AUDIO_BUFFER as short as possible
-                    let mut w = AUDIO_BUFFER.write().unwrap();
-                    w.drain(..new_samples.len());
-                    w.extend(new_samples);
-                }
-            },
-            |err| {
-                panic!("{}", err);
-            },
-            None,
+    let mut resampler = if config.sample_rate.0 != sample_rate {
+        println!(
+            "audio will be resampled from {} to {}",
+            config.sample_rate.0, sample_rate
+        );
+        Some(
+            FftFixedOut::<f32>::new(
+                config.sample_rate.0 as usize,
+                sample_rate as usize,
+                480, // TODO is not always the same
+                1,
+                1,
+            )
+            .unwrap(),
         )
-        .map_err(|err| match err {
-            cpal::BuildStreamError::StreamConfigNotSupported => anyhow!(
-                "Unsupported configuration for this device.\n\
-                Requested configuration: {:?};\n\
-                Supported configuration: {:?}",
-                config,
-                supported_input_configs
-            ),
-            _ => anyhow!(err),
-        })
+    } else {
+        None
+    };
+
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            // remap to one channel
+            // no need to use chunks_exact as exact length is asserted above
+            // TODO what if one channel is inverted?
+            let new_samples = data
+                .chunks_exact(config.channels as usize)
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| f32::from_sample_(*value))
+                        .sum::<f32>()
+                        / (config.channels as f32)
+                })
+                .collect::<Vec<f32>>();
+
+            // resample to sample_rate
+            // TODO This is a convenience wrapper for process_into_buffer that allocates the output buffer with each call. For realtime applications, use process_into_buffer with a buffer allocated by output_buffer_allocate instead of this function.
+            let new_samples = if let Some(ref mut resampler) = &mut resampler {
+                let mut new_samples = resampler.process(&[new_samples], None).unwrap();
+                new_samples.pop().unwrap()
+            } else {
+                new_samples
+            };
+
+            {
+                // lock AUDIO_BUFFER as short as possible
+                let mut w = AUDIO_BUFFER.write().unwrap();
+                w.drain(..new_samples.len());
+                w.extend(new_samples);
+            }
+        },
+        |err| {
+            panic!("{}", err);
+        },
+        None,
+    )?;
+
+    Ok(stream)
 }
 
 fn setup(
@@ -343,7 +321,9 @@ fn setup(
     // add center circle
     commands.spawn((
         MaterialMesh2dBundle {
-            mesh: meshes.add(shape::Circle::new(CIRCLE_RADIUS).into()).into(),
+            mesh: meshes
+                .add(shape::Circle::new(args.circle_radius).into())
+                .into(),
             material: materials.add(ColorMaterial::from(CIRCLE_COLOR)),
             transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
             ..default()
@@ -359,7 +339,7 @@ fn setup(
                     args.artist_name.clone(),
                     TextStyle {
                         font: asset_server.load("FiraSans-Bold.ttf"),
-                        font_size: FONT_SIZE, // TODO drop shadow?
+                        font_size: args.font_size, // TODO drop shadow?
                         color: Color::WHITE,
                         ..default()
                     },
@@ -400,14 +380,58 @@ fn main() -> Result<()> {
     let device = devices
         .get(args.input_device_index)
         .ok_or(anyhow!("Invalid input device index"))?;
-    let stream = init_audio_input(
-        &device,
-        args.sample_rate,
-        args.window_size,
-        args.device_channels,
-        args.device_sample_rate,
-        args.device_buffer_size,
-    )?;
+    println!(
+        "Supported Input Configs for device {}:",
+        args.input_device_index
+    );
+    let supported_input_configs = device.supported_input_configs()?.collect::<Vec<_>>();
+    for (i, input_config) in supported_input_configs.iter().enumerate() {
+        println!("{}: {:?}", i, input_config);
+    }
+    let input_config = supported_input_configs
+        .get(args.device_input_config)
+        .ok_or(anyhow!("Invalid input config selected"))?
+        .clone()
+        .with_sample_rate(SampleRate(args.device_sample_rate));
+    let config = StreamConfig {
+        channels: input_config.channels(),
+        sample_rate: input_config.sample_rate(),
+        buffer_size: cpal::BufferSize::Fixed(args.device_buffer_size),
+    };
+    let stream = match input_config.sample_format() {
+        // TODO use macro
+        SampleFormat::I8 => {
+            init_audio_input::<i8>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::I16 => {
+            init_audio_input::<i16>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::I32 => {
+            init_audio_input::<i32>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::I64 => {
+            init_audio_input::<i64>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::U8 => {
+            init_audio_input::<u8>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::U16 => {
+            init_audio_input::<u16>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::U32 => {
+            init_audio_input::<u32>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::U64 => {
+            init_audio_input::<u64>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::F32 => {
+            init_audio_input::<f32>(&device, args.sample_rate, args.window_size, config)?
+        }
+        SampleFormat::F64 => {
+            init_audio_input::<f64>(&device, args.sample_rate, args.window_size, config)?
+        }
+        _ => todo!(),
+    };
     stream.play()?;
 
     // compute the mel filterbank
@@ -429,13 +453,20 @@ fn main() -> Result<()> {
     App::new()
         // TODO remove default plugins, use only required plugins
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: String::from("DF Visuals"),
-                // mode: WindowMode::Fullscreen, // TODO uncomment
-                resizable: false,
-                resolution: WindowResolution::new(1200., 800.), // TODO comment
-                // window_level: WindowLevel::AlwaysOnTop, // TODO
-                ..default()
+            primary_window: Some(match args.fullscreen {
+                true => Window {
+                    title: String::from(WINDOW_TITLE),
+                    mode: WindowMode::Fullscreen,
+                    resizable: false,
+                    window_level: WindowLevel::AlwaysOnTop,
+                    ..default()
+                },
+                false => Window {
+                    title: String::from(WINDOW_TITLE),
+                    resizable: true,
+                    resolution: WindowResolution::new(1200., 800.),
+                    ..default()
+                },
             }),
             ..default()
         }))
