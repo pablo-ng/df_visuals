@@ -3,61 +3,83 @@ use bevy::{
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
     text::BreakLineOn,
-    window::{WindowLevel, WindowResolution},
+    window::{WindowMode, WindowResolution},
 };
 use clap::Parser;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleRate, Stream, StreamConfig,
 };
+use mel_filter::{mel, NormalizationFactor};
 use rand::Rng;
-use rustfft::{num_complex::Complex, FftPlanner};
-use std::{collections::VecDeque, f32::consts::TAU, sync::RwLock};
+use rubato::{FftFixedIn, Resampler};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
+use std::{
+    collections::VecDeque,
+    f32::consts::TAU,
+    ops::Range,
+    sync::{Arc, RwLock},
+};
 
-#[derive(Parser)]
+#[derive(Parser, Resource)]
 struct Cli {
     input_device_index: usize,
     artist_name: String,
-    #[arg(short, default_value_t = 22050)]
+
+    #[arg(
+        short = 's',
+        default_value_t = 22050,
+        help = "Sample rate used for audio processing"
+    )]
     sample_rate: u32,
-    #[arg(short, default_value_t = 256)]
-    buffer_size: u32,
-    #[arg(short, default_value_t = 1)]
-    channels: u16,
-    #[arg(long, default_value_t = 35)]
-    fps: u32, // TODO test that this matches by printing time delta, TODO higher fps = more particles right now
-    #[arg(long, default_value_t = 0.8)]
+
+    #[arg(
+        short = 'w',
+        default_value_t = 2048,
+        help = "Window size used for audio processing"
+    )]
+    window_size: usize,
+
+    #[arg(short, long, default_value_t = 35)]
+    fps: u32,
+
+    #[arg(
+        long,
+        default_value_t = 22050,
+        help = "Input device sample rate. Will be resamples to sample_rate"
+    )]
+    device_sample_rate: u32,
+
+    #[arg(long, default_value_t = 512, help = "Input device buffer size")]
+    device_buffer_size: u32,
+
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Input device number of channels. Will be remapped to 1 channel."
+    )]
+    device_channels: u16,
+
+    #[arg(long, default_value_t = 150.)]
     particle_amp_threshold: f32,
     #[arg(long, default_value_t = 0.2)]
     particle_logo_probability: f32,
-    #[arg(long, default_value_t = String::from("#053517"))]
-    background_color: String,
-    #[arg(long, default_value_t = String::from("#FF8080"))]
-    particle_normal_color: String, // TODO is overridden by random values
-    #[arg(long, default_value_t = 10.0)]
-    particle_normal_radius: f32,
-    #[arg(long, default_value_t = String::from("#032517"))]
-    circle_color: String,
-    #[arg(long, default_value_t = 100.0)]
-    circle_radius: f32,
 }
 
-#[derive(Resource)]
-struct Params {
-    time_step: f32,
-    artist_name: String,
-    particle_amp_threshold: f32,
-    particle_logo_probability: f32,
-    particle_normal_color: Color,
-    particle_normal_radius: f32,
-    circle_color: Color,
-    circle_radius: f32,
-    sample_rate: u32,
-}
-
-const N_SAMPLES: usize = 480; // TODO always 480?
-
-// TODO WARN bevy_text::glyph_brush: warning[B0005]: Number of font atlases has exceeded the maximum of 16. Performance and memory usage may suffer.
+const BACKGROUND_COLOR: Color = Color::rgb(
+    5. / u8::MAX as f32,
+    53. / u8::MAX as f32,
+    23. / u8::MAX as f32,
+);
+const PARTICLE_NORMAL_COLOR_RANGES: [Range<f32>; 3] = [0.0..0.4, 0.4..1.0, 0.0..0.4];
+const PARTICLE_NORMAL_RADIUS: f32 = 10.0;
+const CIRCLE_COLOR: Color = Color::rgb(
+    3. / u8::MAX as f32,
+    37. / u8::MAX as f32,
+    23. / u8::MAX as f32,
+);
+const CIRCLE_RADIUS: f32 = 200.;
+const FONT_SIZE: f32 = 200.;
 
 #[derive(Component)]
 struct Particle {
@@ -75,60 +97,48 @@ struct LogoImage {
     handle: Handle<Image>,
 }
 
+#[derive(Resource, Debug)]
+struct Dynamics {
+    low_freq_amp: f32,
+    scaling: f32,
+    movement: f32,
+    circle_radius: f32,
+}
+
 #[derive(Resource)]
-struct LowFreqAmp(f32);
+struct DynamicsResource {
+    mel_basis: Vec<Vec<f32>>,
+    fft_runner: Arc<dyn Fft<f32>>,
+}
 
 static AUDIO_BUFFER: RwLock<VecDeque<f32>> = RwLock::new(VecDeque::new());
 
-const WINDOW_SIZE: usize = 4096;
-const HOP_LENGTH: usize = 512;
-const AUDIO_BUFFER_MAX_SIZE: usize = WINDOW_SIZE * 16;
-
-fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>, params: Res<Params>) {
-    // TODO use reader and not drain but use circular?
-
-    // TODO compute the update rate, could also add a flag "newdata" to the buffer
-
+fn update_dynamics(
+    mut dynamics: ResMut<Dynamics>,
+    args: Res<Cli>,
+    dynamics_resource: Res<DynamicsResource>,
+) {
     let mut buffer = {
         // lock AUDIO_BUFFER as short as possible
-        let mut w = AUDIO_BUFFER.write().unwrap();
-        if w.len() < WINDOW_SIZE {
-            return;
-        }
-        let buffer = w
-            .range(..WINDOW_SIZE)
+        let r = AUDIO_BUFFER.read().unwrap();
+        let buffer = r
+            .iter()
             .map(|value| Complex::new(*value, 0.0))
             .collect::<Vec<_>>();
-        w.drain(..HOP_LENGTH);
         buffer
     };
 
-    let mut planner = FftPlanner::new(); // TODO avx planner
-    let fft = planner.plan_fft_forward(WINDOW_SIZE);
+    assert!(buffer.len() == args.window_size); // TODO remove?
 
     // compute the fft
     // TODO use planner with power and abs directly
-    fft.process(&mut buffer);
+    dynamics_resource.fft_runner.process(&mut buffer);
 
     // compute the power spectrum
     let power: Vec<_> = buffer.into_iter().map(|val| val.norm().powi(2)).collect();
 
-    // compute the mel filterbank
-    let n_fft = (WINDOW_SIZE - 1) * 2; // TODO correct?
-    let mel_basis = mel_filter::mel::<f32>(
-        params.sample_rate as usize,
-        n_fft,
-        Some(128), // TODO good?
-        None,
-        None,
-        false,
-        mel_filter::NormalizationFactor::One,
-    );
-
-    // TODO use into_iter everywhere?
-
     // apply the mel filterbank to the power spectrum
-    let mel_power = mel_basis.iter().map(|values| {
+    let mel_power = dynamics_resource.mel_basis.iter().map(|values| {
         values
             .iter()
             .zip(power.iter())
@@ -137,40 +147,39 @@ fn get_low_freq_amp(mut low_freq_amp: ResMut<LowFreqAmp>, params: Res<Params>) {
     });
 
     // compute the log mel spectrogram
-    // TODO  complete this
-    // log_mel_power = librosa.power_to_db(mel_power)
     let log_mel_power = mel_power.map(|val| 10. * val.log10());
 
-    // compute the low-frequency amplitude
-    low_freq_amp.0 = log_mel_power.take(16).sum();
-
-    // low_freq_amp.0 += 1600.;
-    // low_freq_amp.0 *= 0.05;
-
-    dbg!(low_freq_amp.0);
-    // dbg!(r.len()); // TODO should not grow
+    // compute the dynamics
+    let imin = -500.; // TODO choose values wisely
+    let imax = 500.;
+    let omin = 0.6;
+    let omax = 1.4;
+    let ratio = (omax - omin) / (imax - imin);
+    dynamics.low_freq_amp = log_mel_power.take(16).sum::<f32>().clamp(imin, imax);
+    dynamics.scaling = dynamics.low_freq_amp * ratio - imin * ratio + omin;
+    dynamics.movement = dynamics.low_freq_amp / 100.;
+    dynamics.circle_radius = CIRCLE_RADIUS * dynamics.scaling;
 }
 
 fn create_particles(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    low_freq_amp: Res<LowFreqAmp>,
+    dynamics: Res<Dynamics>,
     logo_image: Res<LogoImage>,
-    params: Res<Params>,
+    args: Res<Cli>,
 ) {
     // add new particles
-    if low_freq_amp.0 > params.particle_amp_threshold {
+    if dynamics.low_freq_amp > args.particle_amp_threshold {
         let mut rng = rand::thread_rng();
         let theta: f32 = rng.gen_range(0.0..TAU);
         let velocity = Vec2::new(
-            params.circle_radius * theta.cos(),
-            params.circle_radius * theta.sin(),
+            dynamics.circle_radius * theta.cos(),
+            dynamics.circle_radius * theta.sin(),
         );
         let position = Vec3::from((velocity, 0.0));
-        // TODO circle radius is changing!
 
-        if rng.gen_range(0.0..1.0) < params.particle_logo_probability {
+        if rng.gen_range(0.0..1.0) < args.particle_logo_probability {
             commands.spawn((
                 SpriteBundle {
                     texture: logo_image.handle.clone(),
@@ -180,13 +189,13 @@ fn create_particles(
                 Particle { velocity },
             ));
         } else {
-            let r = rng.gen_range(0.0..0.4);
-            let g = rng.gen_range(0.4..1.0);
-            let b = rng.gen_range(0.0..0.4);
+            let r = rng.gen_range(PARTICLE_NORMAL_COLOR_RANGES[0].clone());
+            let g = rng.gen_range(PARTICLE_NORMAL_COLOR_RANGES[1].clone());
+            let b = rng.gen_range(PARTICLE_NORMAL_COLOR_RANGES[2].clone());
             commands.spawn((
                 MaterialMesh2dBundle {
                     mesh: meshes
-                        .add(shape::Circle::new(params.particle_normal_radius).into())
+                        .add(shape::Circle::new(PARTICLE_NORMAL_RADIUS).into())
                         .into(),
                     material: materials.add(ColorMaterial::from(Color::rgb(r, g, b))),
                     transform: Transform::from_translation(position),
@@ -202,16 +211,22 @@ fn update_particles(
     mut commands: Commands,
     mut query: Query<(Entity, &Particle, &mut Transform)>,
     window_query: Query<&Window>,
-    low_freq_amp: Res<LowFreqAmp>,
-    params: Res<Params>,
+    dynamics: Res<Dynamics>,
+    time: Res<FixedTime>,
 ) {
     let window = window_query.get_single().unwrap();
     let max_x = window.width() / 2.;
     let max_y = window.height() / 2.;
     for (entity, particle, mut transform) in &mut query {
         // move particles
-        transform.translation.x += particle.velocity.x * params.time_step * low_freq_amp.0;
-        transform.translation.y += particle.velocity.y * params.time_step * low_freq_amp.0;
+        let time_step = time.period.as_secs_f32();
+        transform.translation.x += particle.velocity.x * time_step * dynamics.movement;
+        transform.translation.y += particle.velocity.y * time_step * dynamics.movement;
+
+        // clip particle position to circle radius
+        if transform.translation.length() < dynamics.circle_radius {
+            transform.translation = dynamics.circle_radius * transform.translation.normalize();
+        }
 
         // remove particles that are off the screen
         if transform.translation.x.abs() > max_x || transform.translation.y.abs() > max_y {
@@ -220,108 +235,89 @@ fn update_particles(
     }
 }
 
-// TODO merge with update_circle if they stay the same
-fn update_artist_name(
-    mut query: Query<&mut Transform, With<ArtistNameText>>,
-    low_freq_amp: Res<LowFreqAmp>,
+fn update_circle_and_text(
+    mut query: Query<&mut Transform, Or<(With<CenterCircle>, With<ArtistNameText>)>>,
+    dynamics: Res<Dynamics>,
 ) {
-    if let Ok(mut transform) = query.get_single_mut() {
-        transform.scale = Vec3::new(low_freq_amp.0, low_freq_amp.0, 0.);
+    for mut transform in &mut query {
+        transform.scale = Vec3::new(dynamics.scaling, dynamics.scaling, 0.);
     }
 }
-
-fn update_circle(
-    mut query: Query<&mut Transform, With<CenterCircle>>,
-    low_freq_amp: Res<LowFreqAmp>,
-) {
-    if let Ok(mut transform) = query.get_single_mut() {
-        transform.scale = Vec3::new(low_freq_amp.0, low_freq_amp.0, 0.);
-    }
-}
-
-use rubato::{InterpolationParameters, InterpolationType, Resampler, SincFixedIn, WindowFunction};
 
 fn init_audio_input(
     device: &Device,
-    channels: u16,
     sample_rate: u32,
-    buffer_size: u32,
+    window_size: usize,
+    device_channels: u16,
+    device_sample_rate: u32,
+    device_buffer_size: u32,
 ) -> Result<Stream> {
     let supported_input_configs = device.supported_input_configs()?.collect::<Vec<_>>();
     let config = StreamConfig {
-        channels,
-        sample_rate: SampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Fixed(buffer_size), // TODO what is this doing?
+        channels: device_channels,
+        sample_rate: SampleRate(device_sample_rate),
+        buffer_size: cpal::BufferSize::Fixed(device_buffer_size),
     };
 
-    let channels: usize = channels.into();
-    let data_len: usize = channels * N_SAMPLES; // TODO set buffer size to this?
+    let device_channels: usize = device_channels.into();
+
+    {
+        // fill AUDIO_BUFFER with 0
+        let mut w = AUDIO_BUFFER.write().unwrap();
+        w.extend(vec![0.; window_size]);
+        assert!(w.len() == window_size);
+    }
+
+    // TODO still not optimal
+    let mut resampler = FftFixedIn::<f32>::new(
+        device_sample_rate as usize,
+        sample_rate as usize,
+        480, // TODO always? -> no!!
+        1,
+        1,
+    )
+    .unwrap();
+
     device
         .build_input_stream(
             &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // TODO what if one channel is inverted?
-
-                // assert that data length is an integer multiple of channels, should not be deleted
-                assert!(
-                    data.len() == data_len,
-                    "expected {} but received {}",
-                    data_len,
-                    data.len()
-                );
-
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
                 // remap to one channel
                 // no need to use chunks_exact as exact length is asserted above
-                let mut new_samples = [0_f32; N_SAMPLES];
-                for (index, samples) in data.chunks(channels).enumerate() {
-                    new_samples[index] = samples.iter().sum::<f32>() / (channels as f32);
-                }
+                // TODO what if one channel is inverted?
+                let new_samples = data
+                    .chunks_exact(device_channels)
+                    .map(|values| {
+                        values.iter().map(|value| f32::from(*value)).sum::<f32>()
+                            / (device_channels as f32)
+                    })
+                    .collect::<Vec<f32>>();
 
-                // TODO downsample to 22kHz ??
+                // assert!(new_samples == 480); // TODO!
 
-                let params = InterpolationParameters {
-                    sinc_len: 256,
-                    f_cutoff: 0.95,
-                    interpolation: InterpolationType::Linear,
-                    oversampling_factor: 256,
-                    window: WindowFunction::BlackmanHarris2,
-                };
-                let mut resampler = SincFixedIn::<f32>::new(
-                    sample_rate as f64 / 220500 as f64,
-                    2.0,
-                    params,
-                    N_SAMPLES,
-                    1,
-                )
-                .unwrap();
-
-                let new_samples = vec![new_samples; 1];
-                let new_samples = resampler.process(&new_samples, None).unwrap();
+                // resample to sample_rate
+                // TODO This is a convenience wrapper for process_into_buffer that allocates the output buffer with each call. For realtime applications, use process_into_buffer with a buffer allocated by output_buffer_allocate instead of this function.
+                let new_samples = resampler.process(&[new_samples], None).unwrap();
                 let new_samples = &new_samples[0];
-                // dbg!(new_samples.len());
 
-                https://docs.rs/rubato/latest/rubato/
+                // assert!(
+                //     new_samples.len() == HOP_LENGTH,
+                //     "got {} new_samples but expected {}",
+                //     new_samples.len(),
+                //     HOP_LENGTH,
+                // );
 
-
-
-
-                
                 {
                     // lock AUDIO_BUFFER as short as possible
                     let mut w = AUDIO_BUFFER.write().unwrap();
-                    if w.len() > AUDIO_BUFFER_MAX_SIZE {
-                        println!("AUDIO_BUFFER size exceeded");
-                        // remove first N_SAMPLES samples
-                        w.drain(..N_SAMPLES);
-                    }
+                    w.drain(..new_samples.len());
                     w.extend(new_samples);
                 }
             },
             |err| {
-                // TODO change this?
                 panic!("{}", err);
             },
-            None, // TODO change? Some(Duration::new(2, 0))
+            None,
         )
         .map_err(|err| match err {
             cpal::BuildStreamError::StreamConfigNotSupported => anyhow!(
@@ -340,18 +336,15 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     asset_server: Res<AssetServer>,
-    params: Res<Params>,
+    args: Res<Cli>,
 ) {
     commands.spawn(Camera2dBundle::default());
 
     // add center circle
-    // TODO particles must spawn below this!
     commands.spawn((
         MaterialMesh2dBundle {
-            mesh: meshes
-                .add(shape::Circle::new(params.circle_radius).into()) // TODO remove minus
-                .into(),
-            material: materials.add(ColorMaterial::from(params.circle_color)),
+            mesh: meshes.add(shape::Circle::new(CIRCLE_RADIUS).into()).into(),
+            material: materials.add(ColorMaterial::from(CIRCLE_COLOR)),
             transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
             ..default()
         },
@@ -363,10 +356,10 @@ fn setup(
         Text2dBundle {
             text: Text {
                 sections: vec![TextSection::new(
-                    params.artist_name.clone(),
+                    args.artist_name.clone(),
                     TextStyle {
                         font: asset_server.load("FiraSans-Bold.ttf"),
-                        font_size: 60., // TODO font size can be computed?,
+                        font_size: FONT_SIZE, // TODO drop shadow?
                         color: Color::WHITE,
                         ..default()
                     },
@@ -381,24 +374,9 @@ fn setup(
     ));
 
     // load logo image
-    // TODO could be loaded into binary and scaled in a build script
     commands.insert_resource(LogoImage {
         handle: asset_server.load("df_logo.png"),
     });
-}
-
-// TODO can implement into for String??
-fn hex_to_bevy_color(hex: String) -> Result<Color> {
-    let (r, g, b) = {
-        use colors_transform::{Color, Rgb};
-        let color = Rgb::from_hex_str(hex.as_str()).map_err(|err| anyhow!(err.message))?;
-        (
-            color.get_red() / 255.,
-            color.get_green() / 255.,
-            color.get_blue() / 255.,
-        )
-    };
-    Ok(Color::rgb(r, g, b))
 }
 
 fn main() -> Result<()> {
@@ -417,25 +395,36 @@ fn main() -> Result<()> {
     // parse args
     let args = Cli::parse();
     let time_step = 1.0 / args.fps as f32;
-    let params = Params {
-        time_step,
-        artist_name: args.artist_name,
-        particle_amp_threshold: args.particle_amp_threshold,
-        particle_logo_probability: args.particle_logo_probability,
-        circle_color: hex_to_bevy_color(args.circle_color)?,
-        particle_normal_color: hex_to_bevy_color(args.particle_normal_color)?,
-        particle_normal_radius: args.particle_normal_radius,
-        circle_radius: args.circle_radius,
-        sample_rate: args.sample_rate,
-    };
-    let background_color = hex_to_bevy_color(args.background_color)?;
 
     // start audio input stream
     let device = devices
         .get(args.input_device_index)
         .ok_or(anyhow!("Invalid input device index"))?;
-    let stream = init_audio_input(&device, args.channels, args.sample_rate, args.buffer_size)?;
+    let stream = init_audio_input(
+        &device,
+        args.sample_rate,
+        args.window_size,
+        args.device_channels,
+        args.device_sample_rate,
+        args.device_buffer_size,
+    )?;
     stream.play()?;
+
+    // compute the mel filterbank
+    let n_fft = (args.window_size - 1) * 2; // TODO correct?
+    let mel_basis = mel::<f32>(
+        args.sample_rate as usize,
+        n_fft,
+        Some(128), // TODO good?
+        None,
+        None,
+        false,
+        NormalizationFactor::One,
+    );
+
+    // init FftRunner
+    let mut planner = FftPlanner::new();
+    let fft_runner = planner.plan_fft_forward(args.window_size);
 
     App::new()
         // TODO remove default plugins, use only required plugins
@@ -444,22 +433,30 @@ fn main() -> Result<()> {
                 title: String::from("DF Visuals"),
                 // mode: WindowMode::Fullscreen, // TODO uncomment
                 resizable: false,
-                resolution: WindowResolution::new(600., 400.), // TODO comment
-                window_level: WindowLevel::AlwaysOnTop,
+                resolution: WindowResolution::new(1200., 800.), // TODO comment
+                // window_level: WindowLevel::AlwaysOnTop, // TODO
                 ..default()
             }),
             ..default()
         }))
-        .insert_resource(params)
-        .insert_resource(ClearColor(background_color))
-        .insert_resource(LowFreqAmp(0.))
+        .insert_resource(args)
+        .insert_resource(ClearColor(BACKGROUND_COLOR))
+        .insert_resource(Dynamics {
+            low_freq_amp: 0.,
+            scaling: 0.,
+            movement: 0.,
+            circle_radius: 0.,
+        })
+        .insert_resource(DynamicsResource {
+            mel_basis,
+            fft_runner,
+        })
         .add_startup_system(setup)
         .add_systems(
             (
-                get_low_freq_amp,
-                update_artist_name.after(get_low_freq_amp),
-                update_circle.after(get_low_freq_amp),
-                create_particles.after(get_low_freq_amp),
+                update_dynamics,
+                update_circle_and_text.after(update_dynamics),
+                create_particles.after(update_dynamics),
                 update_particles.after(create_particles),
             )
                 .in_schedule(CoreSchedule::FixedUpdate),
