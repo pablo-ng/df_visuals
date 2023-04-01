@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.70"
-# bevy = { version = "0.10.0", features = ["dynamic_linking"] } // TODO revert dynamic_linking for bevy for production
 bevy = "0.10.0"
 clap = { version = "4.1.13", features = ["derive"] }
 cpal = "0.15.1"

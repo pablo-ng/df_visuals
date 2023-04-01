@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bevy::{
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
-    text::BreakLineOn,
+    text::{BreakLineOn, Text2dBounds},
     window::{WindowLevel, WindowMode, WindowResolution},
 };
 use clap::Parser;
@@ -39,6 +39,7 @@ const CIRCLE_COLOR: Color = Color::rgb(
 const AMP_RANGE: [f32; 2] = [-700., 500.];
 const SCALING_RANGE: [f32; 2] = [0.6, 1.4];
 const MOVEMENT_SPEED: f32 = 1. / 60.;
+const SMOOTHING_FACTOR: f32 = 0.6;
 const AMP_SCALING_RATIO: f32 =
     (SCALING_RANGE[1] - SCALING_RANGE[0]) / (AMP_RANGE[1] - AMP_RANGE[0]);
 
@@ -52,8 +53,8 @@ struct Cli {
     window_size: usize,
     #[arg(short, long, default_value_t = 35)]
     fps: u32,
-    #[arg(long, default_value_t = true)]
-    fullscreen: bool,
+    #[arg(long, action)]
+    windowed: bool,
     #[arg(long, default_value_t = 0)]
     device_input_config: usize,
     #[arg(long, default_value_t = 22050)]
@@ -143,8 +144,10 @@ fn update_dynamics(
         .take(16)
         .sum::<f32>()
         .clamp(AMP_RANGE[0], AMP_RANGE[1]);
-    dynamics.scaling = dynamics.low_freq_amp * AMP_SCALING_RATIO - AMP_RANGE[0] * AMP_SCALING_RATIO
-        + SCALING_RANGE[0];
+    dynamics.scaling = (1. - SMOOTHING_FACTOR) * dynamics.scaling
+        + SMOOTHING_FACTOR
+            * (dynamics.low_freq_amp * AMP_SCALING_RATIO - AMP_RANGE[0] * AMP_SCALING_RATIO
+                + SCALING_RANGE[0]);
     dynamics.movement = MOVEMENT_SPEED * dynamics.low_freq_amp;
     dynamics.circle_radius = args.circle_radius * dynamics.scaling;
 }
@@ -348,6 +351,9 @@ fn setup(
                 linebreak_behaviour: BreakLineOn::WordBoundary,
             },
             text_anchor: Anchor::Center,
+            text_2d_bounds: Text2dBounds {
+                size: Vec2::new(args.circle_radius * 2., args.circle_radius * 2.),
+            },
             ..default()
         },
         ArtistNameText,
@@ -453,15 +459,15 @@ fn main() -> Result<()> {
     App::new()
         // TODO remove default plugins, use only required plugins
         .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(match args.fullscreen {
-                true => Window {
+            primary_window: Some(match args.windowed {
+                false => Window {
                     title: String::from(WINDOW_TITLE),
                     mode: WindowMode::Fullscreen,
                     resizable: false,
                     window_level: WindowLevel::AlwaysOnTop,
                     ..default()
                 },
-                false => Window {
+                true => Window {
                     title: String::from(WINDOW_TITLE),
                     resizable: true,
                     resolution: WindowResolution::new(1200., 800.),
